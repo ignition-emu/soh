@@ -73,6 +73,7 @@
 #include "soh/Network/CrowdControl/CrowdControl.h"
 #include "soh/Network/Sail/Sail.h"
 #include "soh/Network/Anchor/Anchor.h"
+#include "soh/Network/SailServer/SailServer.h"
 #include "Enhancements/mods.h"
 #include "Enhancements/game-interactor/GameInteractor.h"
 #include "Enhancements/randomizer/draw.h"
@@ -135,6 +136,9 @@ SpeechSynthesizer* SpeechSynthesizer::Instance;
 CrowdControl* CrowdControl::Instance;
 Sail* Sail::Instance;
 Anchor* Anchor::Instance;
+#ifdef _WIN32
+SailServer* SailServer::Instance;
+#endif
 
 extern "C" char** cameraStrings;
 
@@ -1498,6 +1502,10 @@ extern "C" void InitOTR(int argc, char* argv[]) {
     CrowdControl::Instance = new CrowdControl();
     Sail::Instance = new Sail();
     Anchor::Instance = new Anchor();
+#ifdef _WIN32
+    SailServer::Instance = new SailServer();
+    SailServer::Instance->Start();
+#endif
 
     OTRMessage_Init();
     OTRAudio_Init();
@@ -1558,6 +1566,9 @@ extern "C" void DeinitOTR() {
     if (CVarGetInteger(CVAR_REMOTE_ANCHOR("Enabled"), 0)) {
         Anchor::Instance->Disable();
     }
+#ifdef _WIN32
+    SailServer::Instance->Stop();
+#endif
 #ifdef ENABLE_REMOTE_CONTROL
     SDLNet_Quit();
 #endif
