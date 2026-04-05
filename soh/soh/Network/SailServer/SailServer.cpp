@@ -8,6 +8,7 @@
 
 #include "SailServer.h"
 #include "soh/SaveManager.h"
+#include "soh/SohGui/SohGui.hpp"
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -386,6 +387,11 @@ std::string SailServer::DispatchCommand(const std::string& jsonText) {
         } catch (...) {
             return R"({"result":"error","message":"unknown exception"})";
         }
+        return R"({"result":"ok"})";
+    }
+
+    if (cmd == "toggle_menu") {
+        SohGui::ShowEscMenu();
         return R"({"result":"ok"})";
     }
 
