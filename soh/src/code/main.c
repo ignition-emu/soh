@@ -6,8 +6,10 @@
 #include "global.h"
 #include "vt.h"
 #include "stdio.h"
+#include "string.h"
 #include <soh/Enhancements/bootcommands.h>
 #include "soh/OTRGlobals.h"
+#include "soh/IgnitionSetup.h"
 
 #include <libultraship/bridge.h>
 #include "soh/CrashHandlerExt.h"
@@ -59,6 +61,13 @@ int SDL_main(int argc, char* argv[]) {
 #else //_WIN32
 int main(int argc, char* argv[]) {
 #endif
+    // Ignition headless extraction: run OTR generation without launching the game
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--ignition-extract") == 0 && i + 1 < argc) {
+            return SohIgnitionExtract(argv[i + 1]);
+        }
+    }
+
     GameConsole_Init();
     InitOTR(argc, argv);
     // TODO: Was moved to below InitOTR because it requires window to be setup. But will be late to catch crashes.
