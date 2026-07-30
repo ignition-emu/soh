@@ -134,9 +134,9 @@ SpeechSynthesizer* SpeechSynthesizer::Instance;
 CrowdControl* CrowdControl::Instance;
 Sail* Sail::Instance;
 Anchor* Anchor::Instance;
-#ifdef _WIN32
-SailServer* SailServer::Instance;
-#endif
+// SailServer::Instance is defined in SailServer.cpp. Defining it here too only
+// linked because MSVC merges uninitialized duplicates as common symbols;
+// Clang/GCC default to -fno-common and reject it.
 
 extern "C" char** cameraStrings;
 
@@ -1494,10 +1494,8 @@ extern "C" void InitOTR(int argc, char* argv[]) {
     CrowdControl::Instance = new CrowdControl();
     Sail::Instance = new Sail();
     Anchor::Instance = new Anchor();
-#ifdef _WIN32
     SailServer::Instance = new SailServer();
     SailServer::Instance->Start();
-#endif
 
     OTRMessage_Init();
     OTRAudio_Init();
@@ -1558,9 +1556,7 @@ extern "C" void DeinitOTR() {
     if (CVarGetInteger(CVAR_REMOTE_ANCHOR("Enabled"), 0)) {
         Anchor::Instance->Disable();
     }
-#ifdef _WIN32
     SailServer::Instance->Stop();
-#endif
 #ifdef ENABLE_REMOTE_CONTROL
     SDLNet_Quit();
 #endif

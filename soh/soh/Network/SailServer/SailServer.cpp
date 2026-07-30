@@ -6,6 +6,42 @@
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
 
+using sail_socket_t = SOCKET;
+// recv()/send() take an int length on Winsock but size_t on POSIX; naming the
+// type keeps both free of narrowing-conversion warnings.
+using sail_iolen_t = int;
+#define SAIL_INVALID_SOCKET INVALID_SOCKET
+#define SAIL_SOCKET_ERROR SOCKET_ERROR
+#define sail_close_socket closesocket
+// Winsock never raises SIGPIPE, so no send() flag is needed.
+#define SAIL_SEND_FLAGS 0
+
+#else // !_WIN32
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+#include <cerrno>
+
+using sail_socket_t = int;
+using sail_iolen_t = size_t;
+#define SAIL_INVALID_SOCKET (-1)
+#define SAIL_SOCKET_ERROR (-1)
+#define sail_close_socket ::close
+// Linux suppresses SIGPIPE per-call; macOS/BSD lack MSG_NOSIGNAL and use the
+// SO_NOSIGPIPE socket option instead (applied in HandleConnection). Without one
+// of the two, a client vanishing mid-response would kill the whole game.
+#ifdef MSG_NOSIGNAL
+#define SAIL_SEND_FLAGS MSG_NOSIGNAL
+#else
+#define SAIL_SEND_FLAGS 0
+#endif
+
+#endif // _WIN32
+
 #include "SailServer.h"
 #include "soh/SaveManager.h"
 #include "soh/SohGui/SohGui.hpp"
@@ -132,12 +168,54 @@ static std::string base64(const uint8_t* data, size_t len) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-static bool recvAll(SOCKET s, char* buf, int len) {
+static bool recvAll(sail_socket_t s, char* buf, int len) {
     int received = 0;
     while (received < len) {
-        int r = recv(s, buf + received, len - received, 0);
+        auto r = recv(s, buf + received, static_cast<sail_iolen_t>(len - received), 0);
         if (r <= 0) return false;
-        received += r;
+        received += static_cast<int>(r);
+    }
+    return true;
+}
+
+// Winsock needs explicit teardown; POSIX sockets need none.
+static void sailNetShutdown() {
+#ifdef _WIN32
+    WSACleanup();
+#endif
+}
+
+// Winsock reports through WSAGetLastError(); POSIX through errno.
+static std::string lastSocketError() {
+#ifdef _WIN32
+    return std::to_string(WSAGetLastError());
+#else
+    return std::strerror(errno);
+#endif
+}
+
+// SO_RCVTIMEO/SO_SNDTIMEO take a DWORD of milliseconds on Winsock but a
+// struct timeval on POSIX — passing the wrong one silently leaves the socket
+// blocking forever.
+static void setSocketTimeout(sail_socket_t s, int option, int millis) {
+#ifdef _WIN32
+    DWORD timeout = static_cast<DWORD>(millis);
+    setsockopt(s, SOL_SOCKET, option, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
+    timeval tv{};
+    tv.tv_sec = millis / 1000;
+    tv.tv_usec = (millis % 1000) * 1000;
+    setsockopt(s, SOL_SOCKET, option, &tv, sizeof(tv));
+#endif
+}
+
+// Send everything, tolerating short writes (POSIX send() may return < len).
+static bool sendAll(sail_socket_t s, const char* buf, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        auto n = send(s, buf + sent, static_cast<sail_iolen_t>(len - sent), SAIL_SEND_FLAGS);
+        if (n <= 0) return false;
+        sent += static_cast<size_t>(n);
     }
     return true;
 }
@@ -156,16 +234,18 @@ static std::string trim(const std::string& s) {
 // ---------------------------------------------------------------------------
 
 void SailServer::Start() {
+#ifdef _WIN32
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         SPDLOG_ERROR("[SailServer] WSAStartup failed");
         return;
     }
+#endif
 
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) {
-        SPDLOG_ERROR("[SailServer] socket() failed: {}", WSAGetLastError());
-        WSACleanup();
+    sail_socket_t sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == SAIL_INVALID_SOCKET) {
+        SPDLOG_ERROR("[SailServer] socket() failed: {}", lastSocketError());
+        sailNetShutdown();
         return;
     }
 
@@ -177,19 +257,26 @@ void SailServer::Start() {
     addr.sin_port = htons(43384);
     inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
-    if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
-        SPDLOG_ERROR("[SailServer] bind() failed: {}", WSAGetLastError());
-        closesocket(sock);
-        WSACleanup();
+    if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SAIL_SOCKET_ERROR) {
+        SPDLOG_ERROR("[SailServer] bind() failed: {}", lastSocketError());
+        sail_close_socket(sock);
+        sailNetShutdown();
         return;
     }
 
-    if (listen(sock, SOMAXCONN) == SOCKET_ERROR) {
-        SPDLOG_ERROR("[SailServer] listen() failed: {}", WSAGetLastError());
-        closesocket(sock);
-        WSACleanup();
+    if (listen(sock, SOMAXCONN) == SAIL_SOCKET_ERROR) {
+        SPDLOG_ERROR("[SailServer] listen() failed: {}", lastSocketError());
+        sail_close_socket(sock);
+        sailNetShutdown();
         return;
     }
+
+#ifndef _WIN32
+    // POSIX close() does not reliably wake a thread blocked in accept(), so the
+    // listen socket gets a receive timeout and AcceptLoop re-checks mRunning.
+    // Winsock's closesocket() does unblock accept(), so this is POSIX-only.
+    setSocketTimeout(sock, SO_RCVTIMEO, 250);
+#endif
 
     mListenSocket = static_cast<uintptr_t>(sock);
     mRunning = true;
@@ -199,22 +286,33 @@ void SailServer::Start() {
 
 void SailServer::Stop() {
     mRunning = false;
-    SOCKET sock = static_cast<SOCKET>(mListenSocket);
-    if (sock != INVALID_SOCKET) {
-        closesocket(sock);
-        mListenSocket = static_cast<uintptr_t>(INVALID_SOCKET);
+    sail_socket_t sock = static_cast<sail_socket_t>(mListenSocket);
+    if (sock != SAIL_INVALID_SOCKET) {
+#ifndef _WIN32
+        // Nudge any in-flight accept() before closing the descriptor.
+        shutdown(sock, SHUT_RDWR);
+#endif
+        sail_close_socket(sock);
+        mListenSocket = static_cast<uintptr_t>(SAIL_INVALID_SOCKET);
     }
     if (mAcceptThread.joinable()) {
         mAcceptThread.join();
     }
-    WSACleanup();
+    sailNetShutdown();
 }
 
 void SailServer::AcceptLoop() {
-    SOCKET listenSock = static_cast<SOCKET>(mListenSocket);
+    sail_socket_t listenSock = static_cast<sail_socket_t>(mListenSocket);
     while (mRunning) {
-        SOCKET client = accept(listenSock, nullptr, nullptr);
-        if (client == INVALID_SOCKET) {
+        sail_socket_t client = accept(listenSock, nullptr, nullptr);
+        if (client == SAIL_INVALID_SOCKET) {
+#ifndef _WIN32
+            // The listen socket carries a receive timeout so this loop can
+            // observe mRunning; those wakeups are not errors.
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                continue;
+            }
+#endif
             break; // Socket closed by Stop(), or real error
         }
         HandleConnection(static_cast<uintptr_t>(client));
@@ -222,37 +320,42 @@ void SailServer::AcceptLoop() {
 }
 
 void SailServer::HandleConnection(uintptr_t clientHandle) {
-    SOCKET client = static_cast<SOCKET>(clientHandle);
+    sail_socket_t client = static_cast<sail_socket_t>(clientHandle);
 
-    DWORD timeout = 500;
-    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-    setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    setSocketTimeout(client, SO_RCVTIMEO, 500);
+    setSocketTimeout(client, SO_SNDTIMEO, 500);
+
+#if !defined(_WIN32) && !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
+    // macOS/BSD: suppress SIGPIPE per-socket since MSG_NOSIGNAL is unavailable.
+    int nosigpipe = 1;
+    setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+#endif
 
     if (!PerformHandshake(clientHandle)) {
-        closesocket(client);
+        sail_close_socket(client);
         return;
     }
 
     std::string payload;
     if (!ReadFrame(clientHandle, payload)) {
-        closesocket(client);
+        sail_close_socket(client);
         return;
     }
 
     std::string response = DispatchCommand(payload);
     WriteTextFrame(clientHandle, response);
-    closesocket(client);
+    sail_close_socket(client);
 }
 
 bool SailServer::PerformHandshake(uintptr_t clientHandle) {
-    SOCKET client = static_cast<SOCKET>(clientHandle);
+    sail_socket_t client = static_cast<sail_socket_t>(clientHandle);
 
     // Read HTTP upgrade request until we see the end of headers
     std::string request;
     request.reserve(512);
     char ch;
     while (request.size() < 4096) {
-        int r = recv(client, &ch, 1, 0);
+        auto r = recv(client, &ch, 1, 0);
         if (r <= 0) return false;
         request += ch;
         if (request.size() >= 4 && request.substr(request.size() - 4) == "\r\n\r\n")
@@ -280,12 +383,11 @@ bool SailServer::PerformHandshake(uintptr_t clientHandle) {
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Accept: " + acceptKey + "\r\n"
         "\r\n";
-    int sent = send(client, response.data(), static_cast<int>(response.size()), 0);
-    return sent == static_cast<int>(response.size());
+    return sendAll(client, response.data(), response.size());
 }
 
 bool SailServer::ReadFrame(uintptr_t clientHandle, std::string& out) {
-    SOCKET client = static_cast<SOCKET>(clientHandle);
+    sail_socket_t client = static_cast<sail_socket_t>(clientHandle);
 
     // Read 2-byte frame header
     uint8_t header[2];
@@ -321,7 +423,7 @@ bool SailServer::ReadFrame(uintptr_t clientHandle, std::string& out) {
 }
 
 void SailServer::WriteTextFrame(uintptr_t clientHandle, const std::string& payload) {
-    SOCKET client = static_cast<SOCKET>(clientHandle);
+    sail_socket_t client = static_cast<sail_socket_t>(clientHandle);
     // Server-to-client frames are not masked (RFC 6455 §5.1)
     uint8_t header[4];
     int headerLen;
@@ -337,8 +439,10 @@ void SailServer::WriteTextFrame(uintptr_t clientHandle, const std::string& paylo
         header[3] = static_cast<uint8_t>(len & 0xFF);
         headerLen = 4;
     }
-    send(client, reinterpret_cast<const char*>(header), headerLen, 0);
-    send(client, payload.data(), static_cast<int>(len), 0);
+    if (!sendAll(client, reinterpret_cast<const char*>(header), static_cast<size_t>(headerLen))) {
+        return;
+    }
+    sendAll(client, payload.data(), len);
 }
 
 std::string SailServer::DispatchCommand(const std::string& jsonText) {
@@ -397,5 +501,3 @@ std::string SailServer::DispatchCommand(const std::string& jsonText) {
 
     return R"({"result":"error","message":"unknown command"})";
 }
-
-#endif // _WIN32

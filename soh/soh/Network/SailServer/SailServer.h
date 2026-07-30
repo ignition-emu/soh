@@ -1,5 +1,4 @@
 #pragma once
-#ifdef _WIN32
 #ifdef __cplusplus
 
 #include <atomic>
@@ -10,7 +9,8 @@
 // Implements the Ignition save-state remote-control protocol.
 // Each incoming connection is handled synchronously: read one JSON command,
 // execute it, write one JSON response, close the socket.
-// Windows-only (raw Winsock2, no SDL2_net dependency).
+// Raw sockets (Winsock2 on Windows, BSD sockets elsewhere) — no SDL2_net
+// dependency, so this builds regardless of BUILD_REMOTE_CONTROL.
 class SailServer {
   public:
     static SailServer* Instance;
@@ -22,7 +22,8 @@ class SailServer {
     std::thread mAcceptThread;
     std::atomic<bool> mRunning{ false };
     // Stored as uintptr_t to avoid pulling winsock2.h into the header.
-    // INVALID_SOCKET on Windows is (SOCKET)(~0), i.e. all bits set.
+    // All-bits-set is the invalid sentinel on both platforms: INVALID_SOCKET is
+    // (SOCKET)(~0) on Windows, and -1 widens to the same value on POSIX.
     uintptr_t mListenSocket{ ~uintptr_t(0) };
 
     void AcceptLoop();
@@ -34,4 +35,3 @@ class SailServer {
 };
 
 #endif // __cplusplus
-#endif // _WIN32
