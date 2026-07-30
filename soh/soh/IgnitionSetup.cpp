@@ -1,6 +1,7 @@
 #include "IgnitionSetup.h"
 #include "Extractor/Extract.h"
 #include <atomic>
+#include <exception>
 #include <filesystem>
 #include <cstdio>
 #include <string>
@@ -102,8 +103,20 @@ extern "C" int SohIgnitionExtract(const char* romPath) {
         return 1;
     }
 
+    // The exporter copies files with unguarded std::filesystem calls, so an
+    // unwritable or full export directory escapes as an exception and aborts the
+    // process. Ignition reads our exit code, and a SIGABRT gives it none, so
+    // translate any failure into a plain error exit.
     std::atomic<size_t> extractCount = 0, totalExtract = 0;
-    extract.CallZapd(installPath, exportDir, &extractCount, &totalExtract);
+    try {
+        extract.CallZapd(installPath, exportDir, &extractCount, &totalExtract);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "ignition-extract: extraction failed: %s\n", e.what());
+        return 1;
+    } catch (...) {
+        fprintf(stderr, "ignition-extract: extraction failed with an unknown error\n");
+        return 1;
+    }
 
     std::string otrFile = extract.IsMasterQuest() ? "oot-mq.o2r" : "oot.o2r";
     std::string otrPath = exportDir + "/" + otrFile;
